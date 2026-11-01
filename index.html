@@ -65,6 +65,9 @@
     .spin-button { width: 100%; }
     .spin-button:disabled { opacity: .7; cursor: progress; }
     .spin-button.busy svg { animation: busy 1.4s linear infinite; }
+    .spin-button.stop-ready { background: #b26e53; }
+    .spin-button.stop-ready:hover { background: #985b43; }
+    .hub.stop-ready { background: #a5674f; }
     @keyframes busy { to { transform: rotate(360deg); } }
     .spin-help { font-size: 11px; color: #98a096; text-align: center; margin: 11px 0 0; }
     .section-head { display: flex; align-items: center; justify-content: space-between; gap: 15px; margin-bottom: 18px; }
@@ -241,10 +244,10 @@
           <div role="status" aria-live="polite" aria-atomic="true">
             <p class="result-kicker" id="resultKicker">READY WHEN YOU ARE</p>
             <h2 class="result-title" id="resultTitle">어떤 결과가<br> 기다리고 있을까요?</h2>
-            <p class="result-description" id="resultDescription">버튼을 눌러 돌림판을 돌려보세요.<br> 항목과 확률은 우측 상단 설정에서 바꿀 수 있어요.</p>
+            <p class="result-description" id="resultDescription">돌림판을 돌린 뒤 정지 버튼을 눌러 주세요.<br> 서서히 멈추면서 결과를 알려드릴게요.</p>
           </div>
           <button class="primary spin-button" id="spinButton" type="button"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M19.5 10a7.7 7.7 0 1 0-.8 6.1M19.5 10V4m0 6h-6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><span id="spinLabel">돌림판 돌리기</span></button>
-          <p class="spin-help" id="spinHelp">매번 독립적으로 추첨해요. 같은 결과가 다시 나올 수 있어요.</p>
+          <p class="spin-help" id="spinHelp">정지를 누르기 전까지 계속 돌아가요.</p>
         </div>
       </section>
 
@@ -305,6 +308,12 @@
     let history = [];
     let rotation = 0;
     let spinning = false;
+    let spinPhase = 'idle'; // idle → spinning → stopping → idle
+    let currentRound = null;
+    let lastFrameTime = 0;
+    let frameRequest = 0;
+    const SPIN_SPEED = 720; // 초당 회전 각도
+    const MIN_STOP_SECONDS = 3.8;
     let lastWinner = -1;
     let toastTimer;
     let storageAvailable = true;
@@ -484,7 +493,7 @@
       throw new Error('유효한 추첨 항목이 없습니다.');
     }
 
-    // 당첨 영역 안쪽에서 멈추므로 포인터와 실제 당첨 결과가 일치합니다.
+    // 당첨 영역 안쪽의 정지 방향입니다. 이 값은 회전을 시작할 때 확정합니다.
     function targetRotation(source, winnerIndex, currentRotation, randomFraction) {
       const total = source.reduce((sum, item) => sum + item.units, 0);
       const before = source.slice(0, winnerIndex).reduce((sum, item) => sum + item.units, 0);
@@ -493,57 +502,138 @@
       return currentRotation + 360 * 6 + modulo(finalOrientation - currentRotation);
     }
 
-    function setSpinning(busy) {
-      spinning = busy;
-      $('spinButton').disabled = busy;
-      $('hubSpin').disabled = busy;
-      $('openSettings').disabled = busy;
-      $('spinButton').classList.toggle('busy', busy);
-      $('spinLabel').textContent = busy ? '돌림판이 돌아가고 있어요…' : '다시 돌리기';
-      $('hubLabel').textContent = busy ? '두근두근' : '돌려요';
-      $('wheelRotor').setAttribute('aria-busy', String(busy));
+    // 시작 속도를 유지하며 정해진 위치까지 감속할 거리와 시간을 계산합니다.
+    function createStopPlan(currentRotation, finalOrientation, speed) {
+      const remainingAngle = modulo(finalOrientation - currentRotation);
+      const minimumDistance = speed * MIN_STOP_SECONDS / 2;
+      const extraTurns = Math.max(0, Math.ceil((minimumDistance - remainingAngle) / 360));
+      const distance = remainingAngle + extraTurns * 360;
+      return {
+        start: currentRotation,
+        end: currentRotation + distance,
+        distance,
+        duration: 2000 * distance / speed
+      };
     }
 
-    async function spin() {
-      if (spinning || $('settingsDialog').open) return;
-      const winnerIndex = chooseWinner(items);
-      const result = items[winnerIndex];
-      const endRotation = targetRotation(items, winnerIndex, rotation, randomBelow(1000000) / 1000000);
-      setSpinning(true);
+    // 등감속: 시작할 때의 속도에서 끊김 없이 줄어들어 마지막에는 0이 됩니다.
+    function brakingRotation(plan, elapsedMs) {
+      const progress = Math.min(1, Math.max(0, elapsedMs / plan.duration));
+      return plan.start + plan.distance * (2 * progress - progress * progress);
+    }
+
+    function paintRotation() {
+      $('wheelRotor').style.transform = `rotate(${rotation}deg)`;
+    }
+
+    function setSpinPhase(phase) {
+      spinPhase = phase;
+      spinning = phase !== 'idle';
+      const stopping = phase === 'stopping';
+      const canStop = phase === 'spinning';
+      $('spinButton').disabled = stopping;
+      $('hubSpin').disabled = stopping;
+      $('openSettings').disabled = spinning;
+      $('spinButton').classList.toggle('busy', spinning);
+      $('spinButton').classList.toggle('stop-ready', canStop);
+      $('hubSpin').classList.toggle('stop-ready', canStop);
+      $('spinLabel').textContent = canStop ? '정지' : stopping ? '서서히 멈추는 중…' : '다시 돌리기';
+      $('hubLabel').textContent = canStop ? '정지' : stopping ? '감속 중' : '돌려요';
+      $('hubSpin').setAttribute('aria-label', canStop ? '돌림판 정지' : stopping ? '돌림판 감속 중' : '돌림판 돌리기');
+      $('wheelRotor').setAttribute('aria-busy', String(spinning));
+      $('spinHelp').textContent = canStop ? '원하는 순간에 정지를 눌러 주세요.'
+        : stopping ? '회전 시작 시 정해진 항목에서 멈추고 있어요.'
+        : '매번 독립적으로 추첨해요. 같은 결과가 다시 나올 수 있어요.';
+    }
+
+    function advanceCruise(timestamp) {
+      const elapsed = Math.max(0, timestamp - lastFrameTime) / 1000;
+      rotation = modulo(rotation + currentRound.speed * elapsed);
+      lastFrameTime = timestamp;
+      paintRotation();
+    }
+
+    function animateWheel(timestamp) {
+      frameRequest = 0;
+      if (!currentRound) return;
+      if (spinPhase === 'spinning') {
+        advanceCruise(timestamp);
+      } else if (spinPhase === 'stopping') {
+        const elapsed = Math.max(0, timestamp - currentRound.brake.startedAt);
+        rotation = brakingRotation(currentRound.brake, elapsed);
+        paintRotation();
+        if (elapsed >= currentRound.brake.duration) {
+          finishSpin();
+          return;
+        }
+      }
+      frameRequest = requestAnimationFrame(animateWheel);
+    }
+
+    function startSpin() {
+      if (spinPhase !== 'idle' || $('settingsDialog').open) return;
+      const source = items.map(item => ({ ...item }));
+      const winnerIndex = chooseWinner(source);
+      const randomFraction = randomBelow(1000000) / 1000000;
+      const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      currentRound = {
+        source,
+        winnerIndex,
+        finalOrientation: modulo(targetRotation(source, winnerIndex, 0, randomFraction)),
+        speed: reducedMotion ? SPIN_SPEED / 4 : SPIN_SPEED,
+        brake: null
+      };
+      lastFrameTime = performance.now();
+      setSpinPhase('spinning');
       lastWinner = -1;
       renderEntries();
-      $('resultKicker').textContent = 'A LITTLE MOMENT OF CHANCE';
-      $('resultTitle').textContent = '두근두근, 고르는 중…';
-      $('resultDescription').textContent = '돌림판이 멈추면 결과를 알려드릴게요.';
-      let animation;
-      try {
-        const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-        if (!reducedMotion && typeof $('wheelRotor').animate === 'function') {
-          animation = $('wheelRotor').animate([
-            { transform: `rotate(${rotation}deg)` },
-            { transform: `rotate(${endRotation}deg)` }
-          ], { duration: 5200, easing: 'cubic-bezier(.12,.74,.12,1)', fill: 'forwards' });
-          await animation.finished;
-        }
-      } catch {
-        // 애니메이션이 중단돼도 확정된 당첨 위치와 결과를 표시합니다.
-      } finally {
-        rotation = modulo(endRotation);
-        $('wheelRotor').style.transform = `rotate(${rotation}deg)`;
-        if (animation) animation.cancel();
-        lastWinner = winnerIndex;
-        setSpinning(false);
-        $('resultKicker').textContent = 'TODAY’S LITTLE CHOICE';
-        $('resultTitle').textContent = result.name;
-        const probability = document.createElement('strong');
-        probability.textContent = formatPercent(result.units);
-        $('resultDescription').replaceChildren('이번 선택은 ‘' + result.name + '’!', document.createElement('br'), ' 설정한 당첨 확률은 ', probability, '예요.');
-        history.unshift({ name: result.name, units: result.units, time: Date.now() });
-        history = history.slice(0, 8);
-        renderEntries();
-        renderHistory();
-        if (!saveState()) toast('브라우저가 자동 저장을 허용하지 않아 이번 실행에서만 기록돼요.');
-      }
+      $('resultKicker').textContent = 'SPINNING · PRESS STOP';
+      $('resultTitle').textContent = '두근두근, 돌아가는 중…';
+      $('resultDescription').textContent = '정지 버튼을 누르면 서서히 멈추고 결과가 공개돼요.';
+      frameRequest = requestAnimationFrame(animateWheel);
+    }
+
+    function stopSpin() {
+      if (spinPhase !== 'spinning' || !currentRound) return;
+      const now = performance.now();
+      advanceCruise(now);
+      // 여기서는 새로 추첨하지 않습니다. 시작 시 확정한 당첨 위치를 사용합니다.
+      currentRound.brake = {
+        ...createStopPlan(rotation, currentRound.finalOrientation, currentRound.speed),
+        startedAt: now
+      };
+      setSpinPhase('stopping');
+      $('resultKicker').textContent = 'SLOWING DOWN';
+      $('resultTitle').textContent = '천천히 멈추고 있어요…';
+      $('resultDescription').textContent = '어떤 항목에서 멈출까요? 잠시만 기다려 주세요.';
+    }
+
+    function finishSpin() {
+      if (spinPhase !== 'stopping' || !currentRound) return;
+      const round = currentRound;
+      const result = round.source[round.winnerIndex];
+      rotation = modulo(round.brake.end);
+      paintRotation();
+      if (frameRequest) cancelAnimationFrame(frameRequest);
+      frameRequest = 0;
+      currentRound = null;
+      lastWinner = round.winnerIndex;
+      setSpinPhase('idle');
+      $('resultKicker').textContent = 'TODAY’S LITTLE CHOICE';
+      $('resultTitle').textContent = result.name;
+      const probability = document.createElement('strong');
+      probability.textContent = formatPercent(result.units);
+      $('resultDescription').replaceChildren('이번 선택은 ‘' + result.name + '’!', document.createElement('br'), ' 설정한 당첨 확률은 ', probability, '예요.');
+      history.unshift({ name: result.name, units: result.units, time: Date.now() });
+      history = history.slice(0, 8);
+      renderEntries();
+      renderHistory();
+      if (!saveState()) toast('브라우저가 자동 저장을 허용하지 않아 이번 실행에서만 기록돼요.');
+    }
+
+    function spin() {
+      if (spinPhase === 'idle') startSpin();
+      else if (spinPhase === 'spinning') stopSpin();
     }
 
     function createEditorRow(item, index) {
@@ -711,7 +801,7 @@
       renderEntries();
       $('resultKicker').textContent = 'READY FOR A NEW CHOICE';
       $('resultTitle').textContent = '새로운 선택, 준비 완료!';
-      $('resultDescription').textContent = '설정한 확률이 돌림판에 반영됐어요. 지금 돌려보세요.';
+      $('resultDescription').textContent = '돌림판을 돌린 뒤 정지를 눌러 결과를 확인하세요.';
       $('spinLabel').textContent = '돌림판 돌리기';
       const saved = saveState();
       closeSettings();
